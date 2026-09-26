@@ -698,3 +698,311 @@ def mark_mgr_paid(round_id):
         print(f'SMS error: {e}')
     flash(f'Round {rnd.round_number} marked as paid to {rnd.recipient.name}! SMS sent.', 'success')
     return redirect(url_for('merry_go_round', chama_id=mgr.chama_id))
+    @app.route('/chama/<int:chama_id>/meetings')
+@login_required
+def meetings(chama_id):
+    chama = Chama.query.get_or_404(chama_id)
+    membership = get_membership(current_user.id, chama_id)
+    if not membership:
+        flash('Access denied.', 'danger')
+        return redirect(url_for('dashboard'))
+    all_meetings = Meeting.query.filter_by(chama_id=chama_id).order_by(Meeting.meeting_date.desc()).all()
+    is_admin = is_treasurer_or_chair(current_user, chama_id)
+    return render_template('meetings.html', chama=chama, meetings=all_meetings, is_admin=is_admin)
+
+
+@app.route('/chama/<int:chama_id>/create_meeting', methods=['POST'])
+@login_required
+def create_meeting(chama_id):
+    if not is_treasurer_or_chair(current_user, chama_id):
+        flash('Only treasurer or chairperson can schedule meetings.', 'danger')
+        return redirect(url_for('meetings', chama_id=chama_id))
+    title = request.form.get('title', '').strip()
+    meeting_date_str = request.form.get('meeting_date')
+    location = request.form.get('location', '')
+    agenda = request.form.get('agenda', '')
+    if not title or not meeting_date_str:
+        flash('Title and date are required.', 'danger')
+        return redirect(url_for('meetings', chama_id=chama_id))
+    meeting_date = datetime.strptime(meeting_date_str, '%Y-%m-%dT%H:%M')
+    meeting = Meeting(
+        chama_id=chama_id,
+        title=title,
+        meeting_date=meeting_date,
+        location=location,
+        agenda=agenda,
+        created_by=current_user.id
+    )
+    db.session.add(meeting)
+    db.session.commit()
+    flash('Meeting scheduled successfully!', 'success')
+    return redirect(url_for('meetings', chama_id=chama_id))
+
+
+@app.route('/meeting/<int:meeting_id>')
+@login_required
+def meeting_detail(meeting_id):
+    meeting = Meeting.query.get_or_404(meeting_id)
+    membership = get_membership(current_user.id, meeting.chama_id)
+    if not membership:
+        flash('Access denied.', 'danger')
+        return redirect(url_for('dashboard'))
+    attendances = Attendance.query.filter_by(meeting_id=meeting_id).all()
+    members = Membership.query.filter_by(chama_id=meeting.chama_id, is_active=True).all()
+    is_admin = is_treasurer_or_chair(current_user, meeting.chama_id)
+    return render_template('meeting_detail.html', meeting=meeting, attendances=attendances, members=members, is_admin=is_admin)
+
+
+@app.route('/meeting/<int:meeting_id>/attendance', methods=['POST'])
+@login_required
+def mark_attendance(meeting_id):
+    meeting = Meeting.query.get_or_404(meeting_id)
+    if not is_treasurer_or_chair(current_user, meeting.chama_id):
+        flash('Access denied.', 'danger')
+        return redirect(url_for('meeting_detail', meeting_id=meeting_id))
+    present_ids = request.form.getlist('present')
+    members = Membership.query.filter_by(chama_id=meeting.chama_id, is_active=True).all()
+    for m in members:
+        att = Attendance.query.filter_by(meeting_id=meeting_id, user_id=m.user_id).first()
+        if not att:
+            att = Attendance(meeting_id=meeting_id, user_id=m.user_id)
+            db.session.add(att)
+        att.present = str(m.user_id) in present_ids
+    db.session.commit()
+    flash('Attendance recorded.', 'success')
+    return redirect(url_for('meeting_detail', meeting_id=meeting_id))
+
+
+@app.route('/meeting/<int:meeting_id>/minutes', methods=['POST'])
+@login_required
+def update_minutes(meeting_id):
+    meeting = Meeting.query.get_or_404(meeting_id)
+    if not is_treasurer_or_chair(current_user, meeting.chama_id):
+        flash('Access denied.', 'danger')
+        return redirect(url_for('meeting_detail', meeting_id=meeting_id))
+    meeting.minutes = request.form.get('minutes', '')
+    meeting.status = 'completed'
+    db.session.commit()
+    flash('Minutes saved.', 'success')
+    return redirect(url_for('meeting_detail', meeting_id=meeting_id))
+
+
+@app.route('/chama/<int:chama_id>/fines')
+@login_required
+def fines(chama_id):
+    chama = Chama.query.get_or_404(chama_id)
+    membership = get_membership(current_user.id, chama_id)
+    if not membership:
+        flash('Access denied.', 'danger')
+        return redirect(url_for('dashboard'))
+    all_fines = Fine.query.filter_by(chama_id=chama_id).order_by(Fine.issued_date.desc()).all()
+    is_admin = is_treasurer_or_chair(current_user, chama_id)
+    members = Membership.query.filter_by(chama_id=chama_id, is_active=True).all()
+    return render_template('fines.html', chama=chama, fines=all_fines, is_admin=is_admin, members=members)
+
+
+@app.route('/chama/<int:chama_id>/issue_fine', methods=['POST'])
+@login_required
+def issue_fine(chama_id):
+    if not is_treasurer_or_chair(current_user, chama_id):
+        flash('Only treasurer or chairperson can issue fines.', 'danger')
+        return redirect(url_for('fines', chama_id=chama_id))
+    user_id = int(request.form.get('user_id'))
+    amount = float(request.form.get('amount', 200))
+    reason = request.form.get('reason', '').strip()
+    notes = request.form.get('notes', '')
+    if not reason:
+        flash('Reason is required.', 'danger')
+        return redirect(url_for('fines', chama_id=chama_id))
+    month = date.today().strftime('%Y-%m')
+    fine = Fine(
+        chama_id=chama_id,
+        user_id=user_id,
+        amount=amount,
+        reason=reason,
+        month=month,
+        issued_by=current_user.id,
+        notes=notes
+    )
+    db.session.add(fine)
+    db.session.commit()
+    try:
+        from services.sms import SMSService
+        user = User.query.get(user_id)
+        chama = Chama.query.get(chama_id)
+        if user and chama:
+            SMSService().send(user.phone, f"Hi {user.name}, you have been issued a fine of KES {amount:,.0f} in {chama.name}. Reason: {reason}")
+    except Exception as e:
+        print(f'SMS error: {e}')
+    flash('Fine issued successfully!', 'success')
+    return redirect(url_for('fines', chama_id=chama_id))
+
+
+@app.route('/fine/<int:fine_id>/pay', methods=['POST'])
+@login_required
+def pay_fine(fine_id):
+    fine = Fine.query.get_or_404(fine_id)
+    if not is_treasurer_or_chair(current_user, fine.chama_id) and fine.user_id != current_user.id:
+        flash('Access denied.', 'danger')
+        return redirect(url_for('dashboard'))
+    fine.status = 'paid'
+    fine.paid_date = date.today()
+    db.session.commit()
+    flash('Fine marked as paid.', 'success')
+    return redirect(url_for('fines', chama_id=fine.chama_id))
+
+
+@app.route('/chama/<int:chama_id>/settings', methods=['GET', 'POST'])
+@login_required
+def chama_settings(chama_id):
+    chama = Chama.query.get_or_404(chama_id)
+    if not is_treasurer_or_chair(current_user, chama_id):
+        flash('Access denied.', 'danger')
+        return redirect(url_for('chama_detail', chama_id=chama_id))
+    if request.method == 'POST':
+        chama.name = request.form.get('name', chama.name).strip()
+        chama.description = request.form.get('description', '')
+        chama.contribution_amount = float(request.form.get('contribution_amount', chama.contribution_amount))
+        chama.contribution_day = int(request.form.get('contribution_day', chama.contribution_day))
+        chama.loan_interest_rate = float(request.form.get('loan_interest_rate', chama.loan_interest_rate))
+        chama.max_loan_multiplier = float(request.form.get('max_loan_multiplier', chama.max_loan_multiplier))
+        chama.fine_amount = float(request.form.get('fine_amount', chama.fine_amount))
+        chama.fine_grace_days = int(request.form.get('fine_grace_days', chama.fine_grace_days))
+        chama.currency = request.form.get('currency', chama.currency)
+        db.session.commit()
+        flash('Chama settings updated.', 'success')
+        return redirect(url_for('chama_settings', chama_id=chama_id))
+    return render_template('chama_settings.html', chama=chama)
+
+
+@app.route('/profile', methods=['GET', 'POST'])
+@login_required
+def profile():
+    if request.method == 'POST':
+        name = request.form.get('name', '').strip()
+        if name:
+            current_user.name = name
+            db.session.commit()
+            flash('Profile updated.', 'success')
+        return redirect(url_for('profile'))
+    return render_template('profile.html')
+
+
+# ==================== MPESA (STK Push) ====================
+
+@app.route('/chama/<int:chama_id>/pay', methods=['GET', 'POST'])
+@login_required
+def mpesa_pay(chama_id):
+    chama = Chama.query.get_or_404(chama_id)
+    membership = get_membership(current_user.id, chama_id)
+    if not membership:
+        flash('Access denied.', 'danger')
+        return redirect(url_for('dashboard'))
+    if request.method == 'POST':
+        amount = float(request.form.get('amount', 0))
+        purpose = request.form.get('purpose', 'contribution')
+        phone = _normalize_phone(request.form.get('phone', current_user.phone))
+        if amount <= 0:
+            flash('Invalid amount.', 'danger')
+            return redirect(url_for('mpesa_pay', chama_id=chama_id))
+        # Create pending transaction
+        txn = MpesaTransaction(
+            chama_id=chama_id,
+            user_id=current_user.id,
+            amount=amount,
+            phone=phone,
+            purpose=purpose,
+            status='pending'
+        )
+        db.session.add(txn)
+        db.session.commit()
+        try:
+            from services.mpesa import MpesaService
+            mpesa = MpesaService()
+            result = mpesa.stk_push(phone, amount, account_reference=f"CHAMA{chama_id}", description=purpose)
+            if result.get('CheckoutRequestID'):
+                txn.checkout_request_id = result['CheckoutRequestID']
+                txn.merchant_request_id = result.get('MerchantRequestID')
+                db.session.commit()
+                flash('STK Push sent! Check your phone to complete payment.', 'success')
+            else:
+                txn.status = 'failed'
+                txn.result_desc = str(result)
+                db.session.commit()
+                flash('Failed to initiate M-Pesa payment. Try again later.', 'danger')
+        except Exception as e:
+            print(f'M-Pesa error: {e}')
+            txn.status = 'failed'
+            txn.result_desc = str(e)
+            db.session.commit()
+            flash('M-Pesa service unavailable. Please try again later.', 'danger')
+        return redirect(url_for('chama_detail', chama_id=chama_id))
+    return render_template('mpesa_pay.html', chama=chama)
+
+
+@app.route('/mpesa/callback', methods=['POST'])
+def mpesa_callback():
+    data = request.get_json(silent=True) or {}
+    try:
+        body = data.get('Body', {}).get('stkCallback', {})
+        result_code = body.get('ResultCode')
+        checkout_id = body.get('CheckoutRequestID')
+        txn = MpesaTransaction.query.filter_by(checkout_request_id=checkout_id).first()
+        if not txn:
+            return jsonify({'ResultCode': 0, 'ResultDesc': 'Accepted'})
+        if result_code == 0:
+            # Success
+            metadata = body.get('CallbackMetadata', {}).get('Item', [])
+            receipt = None
+            for item in metadata:
+                if item.get('Name') == 'MpesaReceiptNumber':
+                    receipt = item.get('Value')
+            txn.status = 'completed'
+            txn.mpesa_receipt = receipt
+            txn.completed_at = datetime.utcnow()
+            txn.result_desc = body.get('ResultDesc', 'Success')
+            # Auto-record contribution if purpose is contribution
+            if txn.purpose == 'contribution':
+                month = date.today().strftime('%Y-%m')
+                contrib = Contribution(
+                    chama_id=txn.chama_id,
+                    user_id=txn.user_id,
+                    amount=txn.amount,
+                    contribution_date=date.today(),
+                    month=month,
+                    payment_method='M-Pesa',
+                    mpesa_code=receipt,
+                    recorded_by=txn.user_id
+                )
+                db.session.add(contrib)
+                membership = get_membership(txn.user_id, txn.chama_id)
+                if membership:
+                    membership.total_savings += txn.amount
+            db.session.commit()
+        else:
+            txn.status = 'failed'
+            txn.result_desc = body.get('ResultDesc', 'Failed')
+            db.session.commit()
+    except Exception as e:
+        print(f'Callback error: {e}')
+    return jsonify({'ResultCode': 0, 'ResultDesc': 'Accepted'})
+
+
+# ==================== ERROR HANDLERS ====================
+
+@app.errorhandler(404)
+def not_found(e):
+    return render_template('404.html'), 404
+
+
+@app.errorhandler(500)
+def server_error(e):
+    return render_template('500.html'), 500
+
+
+# ==================== INIT ====================
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
