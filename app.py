@@ -32,8 +32,25 @@ class User(UserMixin, db.Model):
     def set_password(self, password):
         self.password_hash = generate_password_hash(password)
     
-    def check_password(self, password):
+        def check_password(self, password):
         return check_password_hash(self.password_hash, password)
+
+
+class PhoneOTP(db.Model):
+    """One-time codes for phone verification"""
+    id = db.Column(db.Integer, primary_key=True)
+    phone = db.Column(db.String(15), nullable=False, index=True)
+    code = db.Column(db.String(6), nullable=False)
+    purpose = db.Column(db.String(20), default='register')
+    name = db.Column(db.String(100))
+    password_hash = db.Column(db.String(200))
+    is_used = db.Column(db.Boolean, default=False)
+    attempts = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+
+
+class Chama(db.Model):
 
 class Chama(db.Model):
     id = db.Column(db.Integer, primary_key=True)
