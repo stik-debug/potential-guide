@@ -224,6 +224,20 @@ def index():
         return redirect(url_for('dashboard'))
     return render_template('index.html')
 
+def _normalize_phone(phone: str) -> str:
+    phone = phone.strip().replace(' ', '').replace('-', '').replace('+', '')
+    if phone.startswith('254'):
+        phone = '0' + phone[3:]
+    if not phone.startswith('0') and len(phone) == 9:
+        phone = '0' + phone
+    return phone
+
+
+def _generate_otp() -> str:
+    import random
+    return f"{random.randint(100000, 999999)}"
+
+
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if current_user.is_authenticated:
@@ -231,7 +245,7 @@ def register():
     
     if request.method == 'POST':
         name = request.form.get('name', '').strip()
-        phone = request.form.get('phone', '').strip()
+        phone = _normalize_phone(request.form.get('phone', ''))
         password = request.form.get('password', '')
         confirm = request.form.get('confirm_password', '')
         
@@ -239,13 +253,140 @@ def register():
             flash('All fields are required.', 'danger')
             return render_template('register.html')
         
+        if len(phone) < 10:
+            flash('Enter a valid Kenyan phone number (e.g. 07XXXXXXXX).', 'danger')
+            return render_template('register.html')
+        
         if password != confirm:
             flash('Passwords do not match.', 'danger')
             return render_template('register.html')
         
-        if User.query.filter_by(phone=phone).first():
-            flash('Phone number already registered.', 'danger')
+        if len(password) < 6:
+            flash('Password must be at least 6 characters.', 'danger')
             return render_template('register.html')
+        
+        if User.query.filter_by(phone=phone).first():
+            flash('Phone number already registered. Please login.', 'danger')
+            return render_template('register.html')
+        
+        PhoneOTP.query.filter_by(phone=phone, purpose='register', is_used=False).update({'is_used': True})
+        
+        code = _generate_otp()
+        otp = PhoneOTP(
+            phone=phone,
+            code=code,
+            purpose='register',
+            name=name,
+            password_hash=generate_password_hash(password),
+            expires_at=datetime.utcnow() + timedelta(minutes=10)
+        )
+        db.session.add(otp)
+        db.session.commit()
+        
+        try:
+            from services.sms import SMSService
+            sms = SMSService()
+            msg = f"Your ChamaApp verification code is: {code}. Valid for 10 minutes. Do not share this code."
+            result = sms.send(phone, msg)
+            if result.get('simulated'):
+                session['debug_otp'] = code
+        except Exception as e:
+            print(f'OTP SMS error: {e}')
+            session['debug_otp'] = code
+        
+        session['otp_phone'] = phone
+        flash('Verification code sent to your phone. Enter it below.', 'success')
+        return redirect(url_for('verify_otp'))
+    
+    return render_template('register.html')
+
+
+@app.route('/verify-otp', methods=['GET', 'POST'])
+def verify_otp():
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    phone = session.get('otp_phone')
+    if not phone:
+        flash('Please start registration first.', 'warning')
+        return redirect(url_for('register'))
+    
+    debug_otp = session.get('debug_otp')
+    
+    if request.method == 'POST':
+        code = request.form.get('code', '').strip()
+        action = request.form.get('action', 'verify')
+        
+        if action == 'resend':
+            PhoneOTP.query.filter_by(phone=phone, purpose='register', is_used=False).update({'is_used': True})
+            new_code = _generate_otp()
+            last = PhoneOTP.query.filter_by(phone=phone, purpose='register').order_by(PhoneOTP.created_at.desc()).first()
+            otp = PhoneOTP(
+                phone=phone,
+                code=new_code,
+                purpose='register',
+                name=last.name if last else '',
+                password_hash=last.password_hash if last else '',
+                expires_at=datetime.utcnow() + timedelta(minutes=10)
+            )
+            db.session.add(otp)
+            db.session.commit()
+            try:
+                from services.sms import SMSService
+                sms = SMSService()
+                sms.send(phone, f"Your ChamaApp verification code is: {new_code}. Valid for 10 minutes.")
+                session['debug_otp'] = new_code
+            except Exception:
+                session['debug_otp'] = new_code
+            flash('New code sent to your phone.', 'success')
+            return redirect(url_for('verify_otp'))
+        
+        otp = PhoneOTP.query.filter_by(
+            phone=phone, purpose='register', is_used=False, code=code
+        ).order_by(PhoneOTP.created_at.desc()).first()
+        
+        if not otp:
+            latest = PhoneOTP.query.filter_by(phone=phone, purpose='register', is_used=False).order_by(PhoneOTP.created_at.desc()).first()
+            if latest:
+                latest.attempts += 1
+                db.session.commit()
+                if latest.attempts >= 5:
+                    latest.is_used = True
+                    db.session.commit()
+                    flash('Too many wrong attempts. Please register again.', 'danger')
+                    session.pop('otp_phone', None)
+                    session.pop('debug_otp', None)
+                    return redirect(url_for('register'))
+            flash('Invalid code. Please try again.', 'danger')
+            return render_template('verify_otp.html', phone=phone, debug_otp=session.get('debug_otp'))
+        
+        if otp.expires_at < datetime.utcnow():
+            otp.is_used = True
+            db.session.commit()
+            flash('Code expired. Please register again.', 'danger')
+            session.pop('otp_phone', None)
+            session.pop('debug_otp', None)
+            return redirect(url_for('register'))
+        
+        if User.query.filter_by(phone=phone).first():
+            flash('Phone already registered. Please login.', 'warning')
+            session.pop('otp_phone', None)
+            session.pop('debug_otp', None)
+            return redirect(url_for('login'))
+        
+        user = User(name=otp.name, phone=phone, password_hash=otp.password_hash)
+        db.session.add(user)
+        otp.is_used = True
+        db.session.commit()
+        
+        session.pop('otp_phone', None)
+        session.pop('debug_otp', None)
+        
+        login_user(user, remember=True)
+        flash('Phone verified! Welcome to ChamaApp.', 'success')
+        return redirect(url_for('dashboard'))
+    
+    return render_template('verify_otp.html', phone=phone, debug_otp=debug_otp)
         
         user = User(name=name, phone=phone)
         user.set_password(password)
